@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: mywebwerver
+  name: myservice
+  namespace: ckaprep
+spec:
+  selector:
+    app: pod101
+  ports:
+  - port: 80
+  type: NodePort
