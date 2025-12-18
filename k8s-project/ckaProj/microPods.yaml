@@ -19,7 +19,7 @@ spec:
       value: redis://localhost:6379
 
   - name: counter
-    image: Irakai/microservices:counter-v1
+    image: ltagliamonte/counterapp
     ports:
     - containerPort: 8081
     env:
@@ -27,7 +27,7 @@ spec:
       value: http://localhost:8080
 
   - name: poller
-    image: Irakai/microservices:poller-v1
+    image: itanywhere/ita-centreonpoller
     env:
     - name: API_URL
       value: http://localhost:8080
