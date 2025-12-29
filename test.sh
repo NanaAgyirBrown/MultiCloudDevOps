@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DRY_RUN=false
+LOG_FILE="pag_assignments.log"
+RETRY_COUNT=3
+RETRY_DELAY=5
+
+# Parse arguments
+for arg in "$@"; do
+  case $arg in
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    *)
+      echo "Unknown argument: $arg"
+      exit 1
+      ;;
+  esac
+done
+
+# Subscription list map (name -> id)
+declare -A SUB_NAME_TO_ID
+
+# PAG definitions: role|tier|pim_scopes|default_assignable_scope
+# pim_scopes examples:
+#   - subscription names (e.g., "DEV", "HUB")
+#   - management groups prefixed by "MG-" (e.g., "MG-PROD")
+
+declare -A PAG_GROUPS=(
+  ["pag-contributor-swib"]="Contributor|Tier1|DR,Emergency_DR,Hub,Restricted,Shared_Services,PROD|false"
+  ["pag-intune-swib"]="Intune Administrator|Tier1|MG-DR,MG-HUB,MG-NONPROD,MG-PROD|true"
+  ["pag-exchange-swib"]="Exchange Administrator|Tier1|MG-DR,MG-HUB,MG-NONPROD,MG-PROD|true"
+  ["pag-sharepoint-swib"]="SharePoint Administrator|Tier1|MG-DR,MG-HUB,MG-NONPROD,MG-PROD|true"
+  ["pag-reader-swib"]="Global Reader|Tier1|MG-DR,MG-HUB,MG-NONPROD,MG-PROD|true"
+  ["pag-applications-swib"]="Application Administrator|Tier1|MG-DR,MG-HUB,MG-NONPROD,MG-PROD|true"
+)
+
+# -----------------------------------------------------------------------------
+# Logging and retry helpers
+# -----------------------------------------------------------------------------
+log() {
+  echo "$(date +'%Y-%m-%d %H:%M:%S') | $*" | tee -a "$LOG_FILE"
+}
+
+retry() {
+  local n=0
+  until [ $n -ge $RETRY_COUNT ]; do
+    "$@" && return 0
+    n=$((n + 1))
+    log "⚠️ Retry $n/$RETRY_COUNT failed for command: $*"
+    sleep $RETRY_DELAY
+  done
+  log "❌ Command failed after $RETRY_COUNT attempts: $*"
+  return 1
+}
+
+# -----------------------------------------------------------------------------
+# Subscription and scope utilities
+# -----------------------------------------------------------------------------
+resolve_subscription_map() {
+  log "🔍 Loading subscriptions into map..."
+  while IFS=$'\t' read -r name id; do
+    SUB_NAME_TO_ID["$name"]="$id"
+  done < <(az account list --query "[].{name:name, id:id}" -o tsv)
+  log "✅ Loaded ${#SUB_NAME_TO_ID[@]} subscriptions"
+}
+
+resolve_scope_from_name() {
+  local name="$1"
+  local resolved_scope=""
+
+  if [[ "$name" == MG-* ]]; then
+    resolved_scope="/providers/Microsoft.Management/managementGroups/$name"
+  else
+    if [[ -v SUB_NAME_TO_ID["$name"] ]]; then
+      resolved_scope="/subscriptions/${SUB_NAME_TO_ID["$name"]}"
+    else
+      log "❌ ERROR: Subscription name '$name' not found in map."
+      return 1
+    fi
+  fi
+
+  echo "$resolved_scope"
+}
+
+# -----------------------------------------------------------------------------
+# Role type detection
+# -----------------------------------------------------------------------------
+is_entra_role() {
+  local role_name="$1"
+  
+  # Try to find it as an Azure RBAC role
+  local rbac_check
+  rbac_check=$(az role definition list --name "$role_name" --query "[0].id" -o tsv 2>/dev/null || true)
+  
+  if [[ -n "$rbac_check" ]]; then
+    return 1  # It's an RBAC role
+  else
+    return 0  # It's an Entra role
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Entra ID role assignment
+# -----------------------------------------------------------------------------
+assign_entra_role() {
+  local group_object_id="$1"
+  local role_name="$2"
+  local group_name="$3"
+
+  log "🔍 Looking up Entra role template ID for: $role_name"
+  
+  # First, try to get the role template ID from directoryRoleTemplates
+  local role_template_id
+  role_template_id=$(az rest \
+    --method GET \
+    --url "https://graph.microsoft.com/v1.0/directoryRoleTemplates" \
+    --query "value[?displayName=='$role_name'].id | [0]" -o tsv 2>/dev/null || true)
+
+  if [[ -z "$role_template_id" ]]; then
+    log "❌ ERROR: Could not find Entra role template: $role_name"
+    log "💡 Available roles can be listed with: az rest --method GET --url 'https://graph.microsoft.com/v1.0/directoryRoleTemplates' --query 'value[].displayName'"
+    return 1
+  fi
+
+  log "✅ Found role template ID: $role_template_id"
+
+  # Check if the directory role is activated (some roles need activation first)
+  local directory_role_id
+  directory_role_id=$(az rest \
+    --method GET \
+    --url "https://graph.microsoft.com/v1.0/directoryRoles" \
+    --query "value[?roleTemplateId=='$role_template_id'].id | [0]" -o tsv 2>/dev/null || true)
+
+  # If role not activated, activate it
+  if [[ -z "$directory_role_id" ]]; then
+    log "⚠️ Directory role not activated, activating now..."
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[DRY-RUN] Would activate directory role via Graph API"
+      directory_role_id="$role_template_id"
+    else
+      directory_role_id=$(az rest \
+        --method POST \
+        --url "https://graph.microsoft.com/v1.0/directoryRoles" \
+        --headers "Content-Type=application/json" \
+        --body "{\"roleTemplateId\": \"$role_template_id\"}" \
+        --query "id" -o tsv)
+      log "✅ Directory role activated with ID: $directory_role_id"
+    fi
+  fi
+
+  # Check if assignment already exists
+  local existing
+  existing=$(az rest \
+    --method GET \
+    --url "https://graph.microsoft.com/v1.0/directoryRoles/$directory_role_id/members" \
+    --query "value[?id=='$group_object_id'].id | [0]" -o tsv 2>/dev/null || true)
+
+  if [[ -n "$existing" ]]; then
+    log "⚠️ Entra role '$role_name' already assigned to '$group_name'. Skipping."
+    return 0
+  fi
+
+  log "🔹 Assigning Entra role '$role_name' to group '$group_name'..."
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[DRY-RUN] Would assign Entra role via Graph API"
+    return 0
+  fi
+
+  # Assign the role
+  retry az rest \
+    --method POST \
+    --url "https://graph.microsoft.com/v1.0/directoryRoles/$directory_role_id/members/\$ref" \
+    --headers "Content-Type=application/json" \
+    --body "{\"@odata.id\": \"https://graph.microsoft.com/v1.0/directoryObjects/$group_object_id\"}"
+  
+  log "✅ Successfully assigned Entra role '$role_name' to '$group_name'"
+}
+
+# -----------------------------------------------------------------------------
+# Azure RBAC role assignment
+# -----------------------------------------------------------------------------
+assign_rbac_role() {
+  local group_object_id="$1"
+  local role_name="$2"
+  local scope_path="$3"
+  local group_name="$4"
+
+  # Check existing assignment
+  local existing
+  existing=$(az role assignment list \
+    --assignee "$group_object_id" \
+    --scope "$scope_path" \
+    --query "[?roleDefinitionName=='$role_name'].id | [0]" -o tsv 2>/dev/null || true)
+
+  if [[ -n "$existing" ]]; then
+    log "⚠️ RBAC role '$role_name' already assigned to '$group_name' at scope '$scope_path'. Skipping."
+    return 0
+  fi
+
+  log "🔹 Assigning RBAC role '$role_name' to group '$group_name' at scope '$scope_path'..."
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[DRY-RUN] Would run: az role assignment create --assignee-object-id $group_object_id --role \"$role_name\" --scope \"$scope_path\""
+    return 0
+  fi
+
+  retry az role assignment create \
+    --assignee-object-id "$group_object_id" \
+    --role "$role_name" \
+    --scope "$scope_path" \
+    --assignee-principal-type Group \
+    --only-show-errors
+  
+  log "✅ Successfully assigned RBAC role '$role_name' to '$group_name' at '$scope_path'"
+}
+
+# -----------------------------------------------------------------------------
+# Unified role assignment function
+# -----------------------------------------------------------------------------
+assign_role_to_group() {
+  local group_object_id="$1"
+  local role_name="$2"
+  local scope_path="$3"
+  local group_name="$4"
+
+  # Detect role type and route to appropriate function
+  if is_entra_role "$role_name"; then
+    log "📋 Detected Entra ID role: $role_name (tenant-wide, scope ignored)"
+    assign_entra_role "$group_object_id" "$role_name" "$group_name"
+    return $?
+  else
+    log "📋 Detected Azure RBAC role: $role_name"
+    assign_rbac_role "$group_object_id" "$role_name" "$scope_path" "$group_name"
+    return $?
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Main Script Logic
+# -----------------------------------------------------------------------------
+log "======================================================================"
+log "🚀 Starting PAG Group Creation and Role Assignment"
+log "======================================================================"
+log "Dry Run Mode: $DRY_RUN"
+log ""
+
+# 1. Resolve subscription map
+resolve_subscription_map
+
+# 2. Loop through each PAG group
+for group in "${!PAG_GROUPS[@]}"; do
+  IFS='|' read -r role tier pim_scopes default_scope <<<"${PAG_GROUPS[$group]}"
+  IS_ASSIGNABLE="${default_scope}"
+
+  log ""
+  log "======================================================================"
+  log "🔸 Processing group: $group"
+  log "======================================================================"
+  log "   ├─ Role: $role"
+  log "   ├─ Tier: $tier"
+  log "   ├─ PIM Scopes: $pim_scopes"
+  log "   └─ Assignable to Role: $IS_ASSIGNABLE"
+  log ""
+
+  # 3. Create AAD group if it doesn't exist
+  group_id=$(az rest \
+    --method GET \
+    --url "https://graph.microsoft.com/v1.0/groups?\$filter=displayName eq '$group'" \
+    --query "value[0].id" -o tsv 2>/dev/null || true)
+
+  if [[ -z "$group_id" ]]; then
+    log "🪄 Creating Entra ID group: $group..."
+    if [[ "$DRY_RUN" == true ]]; then
+      log "[DRY-RUN] Would create group via Graph API: displayName=$group, mailNickname=$group, isAssignableToRole=$IS_ASSIGNABLE"
+      group_id="00000000-0000-0000-0000-000000000000"
+    else
+      # Build JSON body
+      local group_body
+      group_body=$(cat <<EOF
+{
+  "displayName": "$group",
+  "mailNickname": "$group",
+  "mailEnabled": false,
+  "securityEnabled": true,
+  "isAssignableToRole": $IS_ASSIGNABLE,
+  "description": "Privileged Access Group for $role ($tier)"
+}
+EOF
+)
+      
+      retry az rest \
+        --method POST \
+        --url "https://graph.microsoft.com/v1.0/groups" \
+        --headers "Content-Type=application/json" \
+        --body "$group_body"
+
+      # Wait for replication
+      log "⏳ Waiting for group replication..."
+      sleep 10
+      
+      # Retrieve the created group ID
+      group_id=$(az rest \
+        --method GET \
+        --url "https://graph.microsoft.com/v1.0/groups?\$filter=displayName eq '$group'" \
+        --query "value[0].id" -o tsv)
+    fi
+    log "✅ Created group with ID: $group_id"
+  else
+    log "✅ Entra ID group '$group' already exists (ID: $group_id)"
+  fi
+
+  if [[ -z "$group_id" ]]; then
+    log "❌ Cannot resolve group ID for $group. Skipping role assignments."
+    continue
+  fi
+
+  # 4. Check if this is an Entra role (only assign once, ignore scopes)
+  if is_entra_role "$role"; then
+    log "🔹 Entra role detected - assigning once (tenant-wide)"
+    assign_entra_role "$group_id" "$role" "$group"
+  else
+    # 5. Process each RBAC scope defined
+    log "🔹 RBAC role detected - processing scopes..."
+    IFS=',' read -ra pim_array <<<"$pim_scopes"
+    
+    if [[ ${#pim_array[@]} -eq 0 ]]; then
+      log "⚠️ No scopes defined for RBAC role. Skipping."
+    else
+      for pim_name in "${pim_array[@]}"; do
+        # Trim whitespace
+        pim_name="${pim_name%"${pim_name##*[![:space:]]}"}"
+        pim_name="${pim_name#"${pim_name%%[![:space:]]*}"}"
+
+        # Resolve scope path
+        scope_path=$(resolve_scope_from_name "$pim_name") || {
+          log "⚠️ Skipping invalid scope name: $pim_name"
+          continue
+        }
+        log "🔹 Resolved scope '$pim_name' → $scope_path"
+
+        # Assign role at resolved scope
+        assign_role_to_group "$group_id" "$role" "$scope_path" "$group"
+      done
+    fi
+  fi
+
+  log "✅ Completed processing group: $group"
+  log ""
+done
+
+log ""
+log "======================================================================"
+log "✅ Script execution completed!"
+log "======================================================================"
+log "Log file: $LOG_FILE"

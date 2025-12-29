@@ -1,0 +1,6 @@
+plugin: google.cloud.gcp_compute
+projects:
+  - my-gcp-project
+auth_kind: application
+scope:
+  - https://www.googleapis.com/auth/cloud-platform

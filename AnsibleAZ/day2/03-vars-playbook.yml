@@ -1,0 +1,52 @@
+- name: Install and start web server using variables
+  hosts: awswebservers
+  become: true
+  vars_files:
+    - vars.yml
+  vars:
+    web_user: "{{ 'www-data' if ansible_facts['os_family'] == 'Debian' else 'nginx' }}"
+    web_group: "{{ 'www-data' if ansible_facts['os_family'] == 'Debian' else 'nginx' }}"
+    web_destfolder: "{{ '/var/www/html' if ansible_os_family == 'Debian' else '/usr/share/nginx/html' }}"
+
+  tasks:
+    - name: Install package on Debian/Ubuntu
+      apt: 
+        name: "{{ web_package }}"
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian" or ansible_os_family == "Ubuntu"
+    
+    - name: Install nginx on Amazon Linux 2023 (dnf)
+      dnf:
+        name: "{{ web_package }}"
+        state: present
+      when: ansible_os_family == "Amazon"
+
+    - name: Start Service
+      service:
+        name: "{{ web_service }}"
+        state: started
+        enabled: yes
+    
+    - name: Ensure webroot exists
+      file:
+        path: "{{ web_destfolder }}"
+        state: directory
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: '0755'
+
+    - name: Deploy index.html from template
+      template:
+        src: files/index.html.j2
+        dest: "{{ web_destfolder }}/index.html"
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: '0644'
+      notify: restart nginx
+
+  handlers:
+    - name: restart nginx
+      service:
+        name: "{{ web_service }}"
+        state: restarted

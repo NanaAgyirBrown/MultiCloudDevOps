@@ -1,0 +1,25 @@
+- name: Create Users
+  hosts: webservers
+  become: true
+  vars: 
+    users:
+      - Alice
+      - Bob
+
+  tasks:
+    - name: Create a new user
+      user:
+        name: "{{ item }}"
+        state: present
+        groups: sudo
+        append: yes
+        shell: /bin/bash
+      loop: "{{ users }}"
+
+    - name: Allow Alice passwordless sudo
+      copy:
+        dest: /etc/sudoers.d/alice
+        content: "Alice ALL=(ALL) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: '0440'
