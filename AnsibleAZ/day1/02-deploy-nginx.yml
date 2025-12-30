@@ -1,0 +1,36 @@
+- name: Deploy nginx and a simple web page
+  hosts: webservers
+  become: true
+  tasks:
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Ensure /var/www/html exists
+      file:
+        path: /var/www/html
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Copy index.html to webroot
+      copy: 
+        src: files/index.html.j2
+        dest: /var/www/html/index.html
+        owner: www-data
+        group: www-data
+        mode: '0644'
+    
+    - name: Modify permission on /var/www/html
+      file:
+        path: /var/www/html
+        mode: '0755'
+
+  handlers:
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted

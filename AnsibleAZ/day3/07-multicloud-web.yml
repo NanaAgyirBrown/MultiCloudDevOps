@@ -1,0 +1,36 @@
+- name: Deploy Nginx on all clouds
+  hosts: all
+  become: true
+  vars:
+    web_root: "{{ '/var/www/html' if ansible_os_family == 'Debian' or ansible_os_family == 'Ubuntu' else '/usr/share/nginx/html' }}"
+    web_user: "{{ 'www-data' if ansible_os_family == 'Debian' or ansible_os_family == 'Ubuntu' else  else 'nginx' }}"
+    web_group: "{{ 'www-user' }}"
+  
+  tasks:
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Ensure webroot exists
+      file:
+        path: "{{ web_root }}"
+        state: directory
+        user: "{{ web_user }}"
+        group: "{{ web_group }}"
+
+    - name: Deploy template
+      template:
+        src: files/index.html.j2
+        dest: "{{ web_root }}/index.html"
+        owner: "{{ web_user }}"
+        group: "{{ web_group }}"
+        mode: '0644'
+      notify: restart nginx
+
+  handlers:
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+
