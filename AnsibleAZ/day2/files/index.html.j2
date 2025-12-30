@@ -1,0 +1,7 @@
+<html>
+<head><title>Hello from {{ansible_hostname}}</title></head>
+  <body>
+    <h1>Host Name : {{ansible_hostname}}</h1>
+    <h1>Deployed by Ansible at {{ ansible_date_time.iso8601 }}</h1>
+  </body>
+</html>
